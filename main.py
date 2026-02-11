@@ -2,7 +2,7 @@ import os
 
 os.environ['FLAGS_enable_pir_api'] = '0'
 os.environ['FLAGS_enable_new_executor'] = '0'
-os.environ["FLAGS_use_mkldnn"] = "0"    
+os.environ["FLAGS_use_mkldnn"] = "0"
 
 import uuid
 import shutil
@@ -11,20 +11,21 @@ import cv2
 import numpy as np
 from pathlib import Path
 from PIL import Image
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Request
 from paddleocr import PaddleOCR
 import pytesseract
 import uvicorn
 
 app = FastAPI()
 
-UPLOAD_DIR = Path.home() / "bill_uploads" 
-
-# Ensure the folder is created inside your home directory
-# This won't require 'sudo' because it's your personal  space
+UPLOAD_DIR = Path.home() / "bill_uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 print(f"✅ Storage initialized at: {UPLOAD_DIR}")
-OTHER_BACKEND_URL = "https://arcade-alan-tim-timothy.trycloudflare.com/process" 
+
+OTHER_BACKEND_URL = "https://arcade-alan-tim-timothy.trycloudflare.com/process"
+
+# ⭐ ADD YOUR WHATSAPP TOKEN HERE
+WHATSAPP_ACCESS_TOKEN = "EAAMp9DvkixUBQqIZAk9q10D22kR8jjfWaWfZA6ezbHbmCbwnd1MIGM6BpcHwxoYd84uBMMhA6rwfSz2aKLaPAK6aOMw3dTzrtsA03yvvm99qIXcfXFZBiGJOzqfZAraJS3WHSibonef5LdNiEDMJJAB1iret0S0HZCZCQptwIUE4mlbHPHNe4dZBvByeJhHkolP3Xn5mF4gClnNH6OWrDOaspM9tRKWZCZCk3mVWhSGWLLH7D4T3rc4qKYIJZCfh94X7ep5LUru0idR8s1tpAuOFQWTZB8s"
 
 # --- INITIALIZE OCR ---
 _paddle_ocr = PaddleOCR(
@@ -32,12 +33,15 @@ _paddle_ocr = PaddleOCR(
     use_textline_orientation=True,
 )
 
+# -------------------------------------------------------------------
+# OCR FUNCTION (UNCHANGED)
+# -------------------------------------------------------------------
 def extract_text_from_image(
     image_path: Path,
     confidence_threshold: float = 0.5,
     min_text_length: int = 10
 ) -> str:
-    """Extract text using PaddleOCR with Tesseract fallback."""
+
     if not image_path.exists():
         raise FileNotFoundError(f"Image not found: {image_path}")
 
@@ -47,10 +51,8 @@ def extract_text_from_image(
 
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-    # 1. Primary OCR: PaddleOCR
-    # Note: Using .ocr() instead of .predict() for standard PaddleOCR usage
     result = _paddle_ocr.ocr(img_rgb, cls=True)
-    
+
     paddle_lines = []
     if result and result[0]:
         for line in result[0]:
@@ -60,11 +62,9 @@ def extract_text_from_image(
 
     paddle_text = "\n".join(paddle_lines).strip()
 
-    # Quality check
     if len(paddle_text) >= min_text_length:
         return paddle_text
 
-    # 2. Fallback OCR: Tesseract
     pil_img = Image.fromarray(img_rgb).convert("L")
     is_scanned = np.array(pil_img).std() < 40
 
@@ -75,7 +75,7 @@ def extract_text_from_image(
         tesseract_config = "--oem 3 --psm 6"
 
     tesseract_text = pytesseract.image_to_string(
-        pil_img, 
+        pil_img,
         config=tesseract_config
     ).strip()
 
@@ -83,108 +83,112 @@ def extract_text_from_image(
     print(f"Final extracted text:- {fin_text}")
     return fin_text
 
-# --- API ENDPOINTS ---
-# @app.post("/upload")
-# async def handle_upload(file: UploadFile = File(...)):
-#     try:
-#         # 1. Generate ID and Save Image
-#         unique_id = str(uuid.uuid4())
-#         file_path = UPLOAD_DIR / f"{unique_id}.jpg"
-        
-#         with file_path.open("wb") as buffer:
-#             shutil.copyfileobj(file.file, buffer)
+# -------------------------------------------------------------------
+# ⭐ SHARED PIPELINE (USED BY BOTH FRONTENDS)
+# -------------------------------------------------------------------
+async def process_image_stream(file_stream):
 
-#         # 2. Extract Text
-#         extracted_content = extract_text_from_image(file_path)
+    unique_id = str(uuid.uuid4())
+    file_path = UPLOAD_DIR / f"{unique_id}.jpg"
+    text_file_path = UPLOAD_DIR / f"{unique_id}.txt"
 
-#         # --- NEW: SAVE TO .TXT FILE ---
-#         text_file_path = UPLOAD_DIR / f"{unique_id}.txt"
-#         with open(text_file_path, "w", encoding="utf-8") as f:
-#             f.write(extracted_content)
-#         # ------------------------------
+    # Save Image
+    with file_path.open("wb") as buffer:
+        shutil.copyfileobj(file_stream, buffer)
 
-#         # 3. POST to the other backend
-#         payload = {
-#             "id": unique_id,
-#             "text": extracted_content
-#         }
+    # OCR Extraction
+    extracted_content = extract_text_from_image(file_path)
 
-#         try:
-#             res = requests.post(OTHER_BACKEND_URL, json=payload, timeout=10)
-#             res.raise_for_status()
-#             target_status = "Forwarded Successfully"
-#         except Exception as e:
-#             target_status = f"Forwarding Failed: {str(e)}"
+    # Save TXT
+    with open(text_file_path, "w", encoding="utf-8") as f:
+        f.write(extracted_content)
 
-#         return {
-#             "status": "success",
-#             "unique_id": unique_id,
-#             "text_saved_at": str(text_file_path), # Optional: let the frontend know
-#             "target_system_status": target_status
-#         }
+    # Forward to orchestrator
+    backend_response = None
+    target_status = "Not Sent"
 
-#     except Exception as e:
-#         print(f"Error: {e}")
-#         raise HTTPException(status_code=500, detail=str(e))
+    try:
+        with open(text_file_path, "rb") as f_to_send:
 
+            payload_fields = {"bill_id": unique_id}
+            payload_files = {
+                "file": (text_file_path.name, f_to_send, "text/plain")
+            }
+
+            res = requests.post(
+                OTHER_BACKEND_URL,
+                data=payload_fields,
+                files=payload_files,
+                timeout=60
+            )
+
+            res.raise_for_status()
+            target_status = "File Forwarded Successfully"
+            backend_response = res.json()
+
+    except requests.exceptions.HTTPError as e:
+        print(f"Backend Error: {res.text}")
+        target_status = f"Forwarding Failed: {str(e)}"
+    except Exception as e:
+        print(f"Connection error: {e}")
+        target_status = f"Connection Failed: {str(e)}"
+
+    return unique_id, target_status, backend_response
+
+# -------------------------------------------------------------------
+# FRONTEND 1 — EXISTING UI (UNCHANGED BEHAVIOUR)
+# -------------------------------------------------------------------
 @app.post("/upload")
 async def handle_upload(file: UploadFile = File(...)):
     try:
-        # 1. Generate ID and local paths
-        unique_id = str(uuid.uuid4())
-        file_path = UPLOAD_DIR / f"{unique_id}.jpg"
-        text_file_path = UPLOAD_DIR / f"{unique_id}.txt"
- 
-        # Save the original image
-        with file_path.open("wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
- 
-        # 2. Extract Text (Your existing OCR/Extraction logic)
-        extracted_content = extract_text_from_image(file_path)
- 
-        # 3. Save Text File locally
-        with open(text_file_path, "w", encoding="utf-8") as f:
-            f.write(extracted_content)
- 
-        # 4. Forward to the NetSuite Orchestrator Backend
-        try:
-            with open(text_file_path, "rb") as f_to_send:
-                # Key names must match the FastAPI backend arguments exactly:
-                # bill_id: str = Form(...)
-                # file: UploadFile = File(...)
-                payload_fields = {"bill_id": unique_id}
-                payload_files = {
-                    "file": (text_file_path.name, f_to_send, "text/plain")
-                }
- 
-                res = requests.post(
-                    OTHER_BACKEND_URL,
-                    data=payload_fields,
-                    files=payload_files,
-                    timeout=60  # Increased timeout for LLM processing
-                )
-                # If the backend returns 422, this will raise an exception with the detail
-                res.raise_for_status()
-                target_status = "File Forwarded Successfully"
-                backend_response = res.json()
- 
-        except requests.exceptions.HTTPError as e:
-            error_detail = res.json() if res.content else str(e)
-            print(f"Backend Error: {error_detail}")
-            target_status = f"Forwarding Failed: {error_detail}"
-        except Exception as e:
-            print(f"Connection error: {e}")
-            target_status = f"Connection Failed: {str(e)}"
- 
+        unique_id, target_status, backend_response = await process_image_stream(file.file)
+
         return {
             "status": "success",
             "unique_id": unique_id,
             "target_system_status": target_status,
-            "orchestrator_data": backend_response if target_status == "File Forwarded Successfully" else None
+            "orchestrator_data": backend_response
         }
- 
+
     except Exception as e:
         print(f"Internal Server Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+# -------------------------------------------------------------------
+# ⭐ FRONTEND 2 — WHATSAPP WEBHOOK
+# -------------------------------------------------------------------
+@app.post("/whatsapp/webhook")
+async def whatsapp_webhook(req: Request):
+
+    try:
+        data = await req.json()
+
+        message = data["entry"][0]["changes"][0]["value"]["messages"][0]
+
+        if message["type"] != "image":
+            return {"status": "ignored"}
+
+        media_id = message["image"]["id"]
+
+        headers = {"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}"}
+
+        # Step 1: Get Media URL
+        meta_url = f"https://graph.facebook.com/v21.0/{media_id}"
+        meta_res = requests.get(meta_url, headers=headers)
+        media_url = meta_res.json()["url"]
+
+        # Step 2: Download Image
+        img_response = requests.get(media_url, headers=headers, stream=True)
+
+        # Step 3: Send into SAME pipeline
+        await process_image_stream(img_response.raw)
+
+        return {"status": "ok"}
+
+    except Exception as e:
+        print("WhatsApp webhook error:", e)
+        return {"status": "error"}
+
+# -------------------------------------------------------------------
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
