@@ -27,6 +27,30 @@ OTHER_BACKEND_URL = "https://arcade-alan-tim-timothy.trycloudflare.com/process"
 # ⭐ ADD YOUR WHATSAPP TOKEN HERE
 WHATSAPP_ACCESS_TOKEN = "EAAMp9DvkixUBQqIZAk9q10D22kR8jjfWaWfZA6ezbHbmCbwnd1MIGM6BpcHwxoYd84uBMMhA6rwfSz2aKLaPAK6aOMw3dTzrtsA03yvvm99qIXcfXFZBiGJOzqfZAraJS3WHSibonef5LdNiEDMJJAB1iret0S0HZCZCQptwIUE4mlbHPHNe4dZBvByeJhHkolP3Xn5mF4gClnNH6OWrDOaspM9tRKWZCZCk3mVWhSGWLLH7D4T3rc4qKYIJZCfh94X7ep5LUru0idR8s1tpAuOFQWTZB8s"
 
+# ⭐ VERIFY TOKEN — must match Meta dashboard
+VERIFY_TOKEN = "ShlokaOCR"
+
+
+# -------------------------------------------------------------------
+# ⭐ WHATSAPP WEBHOOK VERIFICATION (THIS IS WHAT YOU WERE MISSING)
+# -------------------------------------------------------------------
+@app.get("/whatsapp/webhook")
+async def verify_whatsapp_webhook(request: Request):
+
+    params = request.query_params
+
+    mode = params.get("hub.mode")
+    token = params.get("hub.verify_token")
+    challenge = params.get("hub.challenge")
+
+    print("Webhook verification attempt:", params)
+
+    if mode == "subscribe" and token == VERIFY_TOKEN:
+        return int(challenge)
+
+    return {"status": "verification failed"}
+
+
 # --- INITIALIZE OCR ---
 _paddle_ocr = PaddleOCR(
     lang="en",
