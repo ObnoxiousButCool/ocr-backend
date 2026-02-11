@@ -173,7 +173,7 @@ async def whatsapp_webhook(req: Request):
         # ⭐ Instant reply
         send_whatsapp_message(
             from_number,
-            "📄 Image received! Processing your bill..."
+            "📄 Image received! Processing your bill... Please check the dashboard in some time. Thank you! :)"
         )
 
         media_id = message["image"]["id"]
