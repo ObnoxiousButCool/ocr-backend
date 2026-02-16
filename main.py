@@ -11,10 +11,11 @@ import cv2
 import numpy as np
 from pathlib import Path
 from PIL import Image
-from fastapi import FastAPI, File, UploadFile, HTTPException, Request
+from fastapi import FastAPI, File, UploadFile, HTTPException, Request, BackgroundTasks
 from paddleocr import PaddleOCR
 import pytesseract
 import uvicorn
+import config
 
 app = FastAPI()
 
@@ -22,20 +23,102 @@ UPLOAD_DIR = Path.home() / "bill_uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 print(f"✅ Storage initialized at: {UPLOAD_DIR}")
 
+# -------------------------------------------------------------------
+# ⭐ CONFIG
+# -------------------------------------------------------------------
 OTHER_BACKEND_URL = "https://arcade-alan-tim-timothy.trycloudflare.com/process"
 
+# Teams
+TEAMS_APP_ID = config.TEAMS_APP_ID
+TEAMS_APP_PASSWORD = config.TEAMS_APP_PASSWORD
+
+# WhatsApp
+WHATSAPP_ACCESS_TOKEN = config.WHATSAPP_ACCESS_TOKEN
+PHONE_NUMBER_ID = config.PHONE_NUMBER_ID
+VERIFY_TOKEN = config.VERIFY_TOKEN
+
 # -------------------------------------------------------------------
-# ⭐ WHATSAPP CONFIG
+# OCR INIT
 # -------------------------------------------------------------------
-
-WHATSAPP_ACCESS_TOKEN = "EAAMp9DvkixUBQqIZAk9q10D22kR8jjfWaWfZA6ezbHbmCbwnd1MIGM6BpcHwxoYd84uBMMhA6rwfSz2aKLaPAK6aOMw3dTzrtsA03yvvm99qIXcfXFZBiGJOzqfZAraJS3WHSibonef5LdNiEDMJJAB1iret0S0HZCZCQptwIUE4mlbHPHNe4dZBvByeJhHkolP3Xn5mF4gClnNH6OWrDOaspM9tRKWZCZCk3mVWhSGWLLH7D4T3rc4qKYIJZCfh94X7ep5LUru0idR8s1tpAuOFQWTZB8s"
-
-
-VERIFY_TOKEN = "ShlokaOCR"
-PHONE_NUMBER_ID = "1033580526497492"  # ⭐ ADD THIS FROM META DASHBOARD
+_paddle_ocr = PaddleOCR(lang="en", use_textline_orientation=True)
 
 # -------------------------------------------------------------------
-# ⭐ SEND MESSAGE BACK TO WHATSAPP
+# OCR FUNCTION
+# -------------------------------------------------------------------
+def extract_text_from_image(image_path: Path):
+
+    img = cv2.imread(str(image_path))
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    result = _paddle_ocr.ocr(img_rgb, cls=True)
+
+    lines = []
+    if result and result[0]:
+        for line in result[0]:
+            text, score = line[1]
+            if score >= 0.5:
+                lines.append(text)
+
+    paddle_text = "\n".join(lines).strip()
+
+    if len(paddle_text) > 10:
+        return paddle_text
+
+    pil_img = Image.fromarray(img_rgb).convert("L")
+    return pytesseract.image_to_string(pil_img, config="--oem 3 --psm 6")
+
+# -------------------------------------------------------------------
+# ⭐ SHARED OCR PIPELINE (BACKGROUND)
+# -------------------------------------------------------------------
+def process_image_stream_background(file_stream, reply_ctx=None):
+
+    try:
+        uid = str(uuid.uuid4())
+        img_path = UPLOAD_DIR / f"{uid}.jpg"
+        txt_path = UPLOAD_DIR / f"{uid}.txt"
+
+        with img_path.open("wb") as f:
+            shutil.copyfileobj(file_stream, f)
+
+        text = extract_text_from_image(img_path)
+
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+        # Forward to orchestrator
+        try:
+            with open(txt_path, "rb") as f:
+                requests.post(
+                    OTHER_BACKEND_URL,
+                    data={"bill_id": uid},
+                    files={"file": (txt_path.name, f, "text/plain")},
+                    timeout=60
+                )
+        except Exception as e:
+            print("Forwarding error:", e)
+
+        # ⭐ SEND COMPLETION MESSAGE IF NEEDED
+        if reply_ctx:
+
+            if reply_ctx["type"] == "teams":
+                send_teams_message(
+                    reply_ctx["service_url"],
+                    reply_ctx["conversation_id"],
+                    reply_ctx["token"],
+                    "✅ Processing complete! Please check the dashboard."
+                )
+
+            if reply_ctx["type"] == "whatsapp":
+                send_whatsapp_message(
+                    reply_ctx["from_number"],
+                    "✅ Processing complete! Please check the dashboard."
+                )
+
+    except Exception as e:
+        print("Background processing error:", e)
+
+# -------------------------------------------------------------------
+# ⭐ WHATSAPP SEND
 # -------------------------------------------------------------------
 def send_whatsapp_message(to_number: str, message_text: str):
 
@@ -53,116 +136,66 @@ def send_whatsapp_message(to_number: str, message_text: str):
         "text": {"body": message_text}
     }
 
-    try:
-        r = requests.post(url, headers=headers, json=payload)
-        print("WhatsApp reply:", r.text)
-    except Exception as e:
-        print("Failed sending WhatsApp message:", e)
+    requests.post(url, headers=headers, json=payload)
 
 # -------------------------------------------------------------------
-# ⭐ WHATSAPP WEBHOOK VERIFICATION (GET)
+# ⭐ TEAMS TOKEN + SEND
+# -------------------------------------------------------------------
+def get_teams_token():
+
+    r = requests.post(
+        "https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token",
+        data={
+            "grant_type": "client_credentials",
+            "client_id": TEAMS_APP_ID,
+            "client_secret": TEAMS_APP_PASSWORD,
+            "scope": "https://api.botframework.com/.default"
+        }
+    )
+    return r.json()["access_token"]
+
+def send_teams_message(service_url, conversation_id, token, message_text):
+
+    url = f"{service_url}/v3/conversations/{conversation_id}/activities"
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {"type": "message", "text": message_text}
+
+    requests.post(url, headers=headers, json=payload)
+
+# -------------------------------------------------------------------
+# ⭐ WHATSAPP VERIFY
 # -------------------------------------------------------------------
 @app.get("/whatsapp/webhook")
 async def verify_whatsapp_webhook(request: Request):
 
     params = request.query_params
-    mode = params.get("hub.mode")
-    token = params.get("hub.verify_token")
-    challenge = params.get("hub.challenge")
-
-    if mode == "subscribe" and token == VERIFY_TOKEN:
-        return int(challenge)
+    if params.get("hub.mode") == "subscribe" and params.get("hub.verify_token") == VERIFY_TOKEN:
+        return int(params.get("hub.challenge"))
 
     return {"status": "verification failed"}
 
 # -------------------------------------------------------------------
-# --- INITIALIZE OCR ---
-# -------------------------------------------------------------------
-_paddle_ocr = PaddleOCR(
-    lang="en",
-    use_textline_orientation=True,
-)
-
-# -------------------------------------------------------------------
-# OCR FUNCTION
-# -------------------------------------------------------------------
-def extract_text_from_image(image_path: Path,
-                            confidence_threshold: float = 0.5,
-                            min_text_length: int = 10) -> str:
-
-    img = cv2.imread(str(image_path))
-    if img is None:
-        raise ValueError("Failed to read image")
-
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    result = _paddle_ocr.ocr(img_rgb, cls=True)
-
-    paddle_lines = []
-    if result and result[0]:
-        for line in result[0]:
-            text, score = line[1]
-            if score >= confidence_threshold:
-                paddle_lines.append(text)
-
-    paddle_text = "\n".join(paddle_lines).strip()
-
-    if len(paddle_text) >= min_text_length:
-        return paddle_text
-
-    pil_img = Image.fromarray(img_rgb).convert("L")
-    tesseract_text = pytesseract.image_to_string(
-        pil_img, config="--oem 3 --psm 6"
-    ).strip()
-
-    return tesseract_text if len(tesseract_text) > len(paddle_text) else paddle_text
-
-# -------------------------------------------------------------------
-# ⭐ SHARED PIPELINE
-# -------------------------------------------------------------------
-async def process_image_stream(file_stream):
-
-    unique_id = str(uuid.uuid4())
-    file_path = UPLOAD_DIR / f"{unique_id}.jpg"
-    text_file_path = UPLOAD_DIR / f"{unique_id}.txt"
-
-    with file_path.open("wb") as buffer:
-        shutil.copyfileobj(file_stream, buffer)
-
-    extracted_content = extract_text_from_image(file_path)
-
-    with open(text_file_path, "w", encoding="utf-8") as f:
-        f.write(extracted_content)
-
-    try:
-        with open(text_file_path, "rb") as f_to_send:
-            requests.post(
-                OTHER_BACKEND_URL,
-                data={"bill_id": unique_id},
-                files={"file": (text_file_path.name, f_to_send, "text/plain")},
-                timeout=60
-            )
-    except Exception as e:
-        print("Forwarding error:", e)
-
-# -------------------------------------------------------------------
-# FRONTEND 1 — EXISTING UI
+# FRONTEND 1 — WEB UI
 # -------------------------------------------------------------------
 @app.post("/upload")
-async def handle_upload(file: UploadFile = File(...)):
-    try:
-        await process_image_stream(file.file)
-        return {"status": "success"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+async def handle_upload(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    background_tasks.add_task(process_image_stream_background, file.file)
+    return {"status": "processing started"}
 
 # -------------------------------------------------------------------
-# ⭐ FRONTEND 2 — WHATSAPP WEBHOOK (POST)
+# ⭐ WHATSAPP WEBHOOK
 # -------------------------------------------------------------------
 @app.post("/whatsapp/webhook")
-async def whatsapp_webhook(req: Request):
+async def whatsapp_webhook(req: Request, background_tasks: BackgroundTasks):
+
+    data = await req.json()
 
     try:
-        data = await req.json()
         message = data["entry"][0]["changes"][0]["value"]["messages"][0]
 
         if message["type"] != "image":
@@ -170,26 +203,88 @@ async def whatsapp_webhook(req: Request):
 
         from_number = message["from"]
 
-        # ⭐ Instant reply
         send_whatsapp_message(
             from_number,
-            "📄 Image received! Processing your bill... Please check the dashboard in some time. Thank you! :)"
+            "📄 Image received! Processing your bill..."
         )
 
         media_id = message["image"]["id"]
         headers = {"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}"}
 
-        meta_url = f"https://graph.facebook.com/v21.0/{media_id}"
-        media_url = requests.get(meta_url, headers=headers).json()["url"]
+        media_url = requests.get(
+            f"https://graph.facebook.com/v21.0/{media_id}",
+            headers=headers
+        ).json()["url"]
 
-        img_response = requests.get(media_url, headers=headers, stream=True)
+        img = requests.get(media_url, headers=headers, stream=True)
 
-        await process_image_stream(img_response.raw)
+        background_tasks.add_task(
+            process_image_stream_background,
+            img.raw,
+            {
+                "type": "whatsapp",
+                "from_number": from_number
+            }
+        )
 
-        return {"status": "ok"}
+        return {"status": "accepted"}
 
     except Exception as e:
         print("WhatsApp webhook error:", e)
+        return {"status": "error"}
+
+# -------------------------------------------------------------------
+# ⭐ TEAMS WEBHOOK
+# -------------------------------------------------------------------
+@app.post("/teams/webhook")
+async def teams_webhook(req: Request, background_tasks: BackgroundTasks):
+
+    try:
+        data = await req.json()
+
+        if data.get("type") != "message":
+            return {"status": "ignored"}
+
+        attachments = data.get("attachments") or []
+        if not attachments:
+            return {"status": "no image"}
+
+        image_url = attachments[0].get("contentUrl")
+
+        service_url = data["serviceUrl"]
+        conversation_id = data["conversation"]["id"]
+
+        token = get_teams_token()
+
+        send_teams_message(
+            service_url,
+            conversation_id,
+            token,
+            "📄 Image received! Processing your bill..."
+        )
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+
+        img_response = requests.get(image_url, headers=headers, stream=True)
+
+        background_tasks.add_task(
+            process_image_stream_background,
+            img_response.raw,
+            {
+                "type": "teams",
+                "service_url": service_url,
+                "conversation_id": conversation_id,
+                "token": token
+            }
+        )
+
+        return {"status": "accepted"}
+
+    except Exception as e:
+        print("Teams webhook error:", e)
         return {"status": "error"}
 
 # -------------------------------------------------------------------
