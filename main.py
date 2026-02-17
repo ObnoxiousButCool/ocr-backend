@@ -15,6 +15,7 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from paddleocr import PaddleOCR
 import pytesseract
 import uvicorn
+import logging
 
 app = FastAPI()
 
@@ -32,56 +33,121 @@ _paddle_ocr = PaddleOCR(
     use_textline_orientation=True,
 )
 
-def extract_text_from_image(
-    image_path: Path,
-    confidence_threshold: float = 0.5,
-    min_text_length: int = 10
-) -> str:
-    """Extract text using PaddleOCR with Tesseract fallback."""
-    if not image_path.exists():
-        raise FileNotFoundError(f"Image not found: {image_path}")
+lg = logging.getLogger("main")
 
-    img = cv2.imread(str(image_path))
-    if img is None:
-        raise ValueError("Failed to read image")
+# def extract_text_from_image(
+#     image_path: Path,
+#     confidence_threshold: float = 0.5,
+#     min_text_length: int = 10
+# ) -> str:
+#     """Extract text using PaddleOCR with Tesseract fallback."""
+#     if not image_path.exists():
+#         raise FileNotFoundError(f"Image not found: {image_path}")
 
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+#     img = cv2.imread(str(image_path))
+#     if img is None:
+#         raise ValueError("Failed to read image")
 
-    # 1. Primary OCR: PaddleOCR
-    # Note: Using .ocr() instead of .predict() for standard PaddleOCR usage
-    result = _paddle_ocr.ocr(img_rgb, cls=True)
+#     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+#     # 1. Primary OCR: PaddleOCR
+#     # Note: Using .ocr() instead of .predict() for standard PaddleOCR usage
+#     result = _paddle_ocr.ocr(img_rgb, cls=True)
     
-    paddle_lines = []
-    if result and result[0]:
-        for line in result[0]:
-            text, score = line[1]
-            if score >= confidence_threshold:
-                paddle_lines.append(text)
+#     paddle_lines = []
+#     if result and result[0]:
+#         for line in result[0]:
+#             text, score = line[1]
+#             if score >= confidence_threshold:
+#                 paddle_lines.append(text)
 
-    paddle_text = "\n".join(paddle_lines).strip()
+#     paddle_text = "\n".join(paddle_lines).strip()
 
-    # Quality check
-    if len(paddle_text) >= min_text_length:
-        return paddle_text
+#     # Quality check
+#     if len(paddle_text) >= min_text_length:
+#         return paddle_text
 
-    # 2. Fallback OCR: Tesseract
-    pil_img = Image.fromarray(img_rgb).convert("L")
-    is_scanned = np.array(pil_img).std() < 40
+#     # 2. Fallback OCR: Tesseract
+#     pil_img = Image.fromarray(img_rgb).convert("L")
+#     is_scanned = np.array(pil_img).std() < 40
 
-    if is_scanned:
-        pil_img = pil_img.point(lambda x: 0 if x < 180 else 255, "1")
-        tesseract_config = "--oem 3 --psm 3"
-    else:
-        tesseract_config = "--oem 3 --psm 6"
+#     if is_scanned:
+#         pil_img = pil_img.point(lambda x: 0 if x < 180 else 255, "1")
+#         tesseract_config = "--oem 3 --psm 3"
+#     else:
+#         tesseract_config = "--oem 3 --psm 6"
 
-    tesseract_text = pytesseract.image_to_string(
-        pil_img, 
-        config=tesseract_config
-    ).strip()
+#     tesseract_text = pytesseract.image_to_string(
+#         pil_img, 
+#         config=tesseract_config
+#     ).strip()
 
-    fin_text = tesseract_text if len(tesseract_text) > len(paddle_text) else paddle_text
-    print(f"Final extracted text:- {fin_text}")
-    return fin_text
+#     fin_text = tesseract_text if len(tesseract_text) > len(paddle_text) else paddle_text
+#     print(f"Final extracted text:- {fin_text}")
+#     return fin_text
+
+import numpy as np
+
+def extract_text_from_image(image_path: Path, confidence_threshold: float = 0.5) -> str:
+    img = cv2.imread(str(image_path))
+    result = _paddle_ocr.ocr(img, cls=True)
+    
+    if not result or not result[0]:
+        return ""
+
+    lines = []
+    for line in result[0]:
+        box = line[0]
+        text = line[1][0]
+        score = line[1][1]
+        if score >= confidence_threshold:
+            # Get center Y and start X
+            y_center = sum([p[1] for p in box]) / 4
+            x_start = box[0][0]
+            lines.append({'y': y_center, 'x': x_start, 'text': text})
+
+    # --- THE FIX: LINE SNAPPING ---
+    # We round all Y coordinates to the nearest 15 pixels. 
+    # This forces items on roughly the same line to have the EXACT same Y value.
+    grid_size = 20 # Adjust this (15-25) based on how cramped the bill is
+    for item in lines:
+        item['y'] = round(item['y'] / grid_size) * grid_size
+
+    # 1. Sort by the snapped Y, then by X
+    lines.sort(key=lambda x: (x['y'], x['x']))
+
+    # 2. Group by the snapped Y
+    rows = {}
+    for item in lines:
+        y = item['y']
+        if y not in rows:
+            rows[y] = []
+        rows[y].append(item)
+
+    # 3. Build the text file with spatial padding
+    final_output = []
+    sorted_y_keys = sorted(rows.keys())
+    
+    for y in sorted_y_keys:
+        row_items = rows[y]
+        # Sort left to right
+        row_items.sort(key=lambda x: x['x'])
+        
+        # Create a virtual canvas for the line
+        line_canvas = [" "] * 100
+        for item in row_items:
+            # Map X (0-image_width) to 0-100 characters
+            # Assuming image width is around 800-1000px
+            char_pos = int(item['x'] / 10) 
+            if char_pos < len(line_canvas):
+                text = item['text']
+                for i, char in enumerate(text):
+                    if char_pos + i < len(line_canvas):
+                        line_canvas[char_pos + i] = char
+        
+        final_output.append("".join(line_canvas).rstrip())
+
+    return "\n".join(final_output)
 
 # --- API ENDPOINTS ---
 # @app.post("/upload")
