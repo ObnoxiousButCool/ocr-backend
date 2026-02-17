@@ -101,6 +101,7 @@ def process_image_stream_background(file_stream, reply_ctx=None):
         if reply_ctx:
 
             if reply_ctx["type"] == "teams":
+
                 fresh_token = get_teams_token()
 
                 send_teams_message(
@@ -109,7 +110,7 @@ def process_image_stream_background(file_stream, reply_ctx=None):
                     fresh_token,
                     "✅ Processing complete! Please check the dashboard."
                 )
-
+        
             if reply_ctx["type"] == "whatsapp":
                 send_whatsapp_message(
                     reply_ctx["from_number"],
@@ -159,6 +160,21 @@ def get_teams_token():
     print("Teams token response:", r.text)
 
     data = r.json()
+    # url = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+
+    if "access_token" not in data:
+        raise Exception(f"Teams token failed: {data}")
+
+    return data["access_token"]
+  
+def send_teams_message(
+    service_url,
+    conversation_id,
+    token,
+    message_text,
+    bot_id,
+    reply_to_id=None
+):
 
     if "access_token" not in data:
         raise Exception(f"Teams token failed: {data}")
@@ -192,10 +208,10 @@ def send_teams_message(
     if reply_to_id:
         payload["replyToId"] = reply_to_id
 
+
     r = requests.post(url, headers=headers, json=payload)
     print("Teams send response:", r.status_code, r.text)
-
-
+   
 # -------------------------------------------------------------------
 # ⭐ WHATSAPP VERIFY
 # -------------------------------------------------------------------
@@ -343,6 +359,7 @@ async def teams_webhook(req: Request, background_tasks: BackgroundTasks):
         return {"status": "error"}
 
 
+ 
 # -------------------------------------------------------------------
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
